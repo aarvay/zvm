@@ -1,0 +1,50 @@
+#compdef zvm
+
+local -a candidates
+local mode='' token id description
+local used_spec=no used_use=no used_no_zls=no
+integer i
+if (( CURRENT == 2 )); then
+    candidates=(
+        'install:Install Zig' 'use:Select Zig offline' 'unset:Clear selection'
+        'current:Print selection' 'list:List Zig builds' 'uninstall:Remove toolchains'
+        'zls:Manage ZLS' '--help:Show usage' '--version:Print the manager version'
+    )
+else
+    case "$words[2]" in
+        install)
+            for ((i=3; i<CURRENT; i++)); do
+                token="$words[i]"
+                case "$token" in
+                    --use) [[ "$used_use" == no ]] || return 0; used_use=yes ;;
+                    --no-zls) [[ "$used_no_zls" == no ]] || return 0; used_no_zls=yes ;;
+                    -*|'') return 0 ;;
+                    *) [[ "$used_spec" == no ]] || return 0; used_spec=yes ;;
+                esac
+            done
+            [[ "$used_use" == yes ]] || candidates+=('--use:Select after install')
+            [[ "$used_no_zls" == yes ]] || candidates+=('--no-zls:Skip ZLS')
+            if [[ "$used_spec" == no && "$PREFIX" != -* ]]; then
+                candidates+=('latest:Newest stable Zig' 'master:Current development build')
+                mode=installable
+            fi
+            ;;
+        use) if (( CURRENT == 3 )); then mode=installed; fi ;;
+        list) if (( CURRENT == 3 )); then candidates=('--remote:List platform builds'); fi ;;
+        uninstall)
+            if (( CURRENT == 3 )); then candidates=('--all:Remove all managed versions'); mode=inactive
+            elif (( CURRENT == 4 )) && [[ "$words[3]" == --all ]]; then candidates=('--yes:Confirm removal'); fi
+            ;;
+        zls)
+            if (( CURRENT == 3 )); then candidates=('install:Install compatible ZLS')
+            elif (( CURRENT == 4 )) && [[ "$words[3]" == install ]]; then mode=installed; fi
+            ;;
+    esac
+fi
+if [[ -n "$mode" && "$PREFIX" != -* ]]; then
+    while IFS=$'\t' read -r id description; do
+        if [[ -n "$description" ]]; then candidates+=("$id:$description"); else candidates+=("$id"); fi
+    done < <(zvm __complete "$mode" 2>/dev/null)
+fi
+(( ${#candidates} )) || return 0
+_describe 'zvm' candidates

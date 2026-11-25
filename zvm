@@ -1,0 +1,752 @@
+#!/usr/bin/env bash
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then set -euo pipefail; fi
+
+readonly VERSION=1.0.0
+readonly ID_RE='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-dev\.(0|[1-9][0-9]*)\+[a-f0-9]{1,40})?'
+readonly INDEX_URL=https://ziglang.org/download/index.json
+readonly ZLS_URL=https://releases.zigtools.org/v1/zls/select-version
+readonly CACHE_MAX_AGE=3600
+
+say() { printf '%s\n' "$*" >&2; }
+die() {
+    if [[ -t 2 && -z ${NO_COLOR+x} ]]; then
+        printf '\033[31mError:\033[0m %s\n' "$*" >&2
+    else
+        say "Error: $*"
+    fi
+    exit 1
+}
+
+valid_id() { [[ "$1" =~ ^${ID_RE}$ ]]; }
+exists() { [[ -e "$1" || -L "$1" ]]; }
+plain_dir() { [[ -d "$1" && ! -L "$1" ]]; }
+plain_file() { [[ -f "$1" && ! -L "$1" ]]; }
+
+link_target() {
+    # Preserve trailing newlines in the target, not readlink's own newline.
+    local raw
+    raw=$(readlink "$1" && printf '.') || return 1
+    printf '%s.' "${raw%$'\n.'}"
+}
+
+# Callers stage on the destination filesystem. Never hand mv a real destination
+# directory, and use the platform's option to replace a symlink as a path.
+replace_path() {
+    [[ ! -d "$2" || -L "$2" ]] || return 1
+    case "$(uname -s)" in
+        Darwin) command mv -fh -- "$1" "$2" ;;
+        Linux) command mv -fT -- "$1" "$2" ;;
+        *) return 1 ;;
+    esac
+}
+
+publish_new() {
+    ! exists "$2" || return 1
+    case "$(uname -s)" in
+        Darwin) command mv -nh -- "$1" "$2" || return 1 ;;
+        Linux) command mv -nT -- "$1" "$2" || return 1 ;;
+        *) return 1 ;;
+    esac
+    ! exists "$1"
+}
+
+commit_selection() (
+    # The parent keeps the operation lock. Complete or roll back before the
+    # parent handles a terminal signal. ln -h/-T never writes into a directory.
+    trap '' INT TERM HUP
+    local src="$1" dest="$2" mode="$3" tool failed=no
+    local -a added=()
+    shift 3
+    for tool in "$@"; do
+        if owned_link "$tool"; then continue; fi
+        if ! create_link "$CURRENT/$tool" "$BIN/$tool"; then failed=yes; break; fi
+        added+=("$tool")
+    done
+    if [[ "$failed" == no ]]; then
+        case "$mode" in
+            replace) if replace_path "$src" "$dest"; then return 0; fi ;;
+            new) if publish_new "$src" "$dest"; then return 0; fi ;;
+            links) return 0 ;;
+        esac
+    fi
+    if (( ${#added[@]} )); then
+        for tool in "${added[@]}"; do
+            if owned_link "$tool"; then rm -- "$BIN/$tool" || say "Cannot roll back $tool link"; fi
+        done
+    fi
+    return 1
+)
+
+create_link() {
+    ! exists "$2" || return 1
+    case "$(uname -s)" in
+        Darwin) command ln -sh -- "$1" "$2" ;;
+        Linux) command ln -sT -- "$1" "$2" ;;
+        *) return 1 ;;
+    esac
+}
+
+# bsdtar is both the validator's parser and the extractor. In the C locale it
+# escapes control characters and backslashes; reject escapes, path traversal,
+# duplicate entries, and all types other than ordinary files and directories.
+extract_archive() {
+    local archive="$1" dest="$2" member detail reader
+    reader=$(archive_tool) || { say 'Missing required tool: BSD tar with XZ support'; return 1; }
+    LC_ALL=C "$reader" -tf "$archive" > "$STAGE/members" || return 1
+    LC_ALL=C "$reader" -tvf "$archive" > "$STAGE/details" || return 1
+    [[ -s "$STAGE/members" ]] || return 1
+    while IFS= read -r member; do
+        IFS= read -r detail <&8 || return 1
+        case "$detail" in
+            d*) member="${member%/}" ;;
+            -*) ;;
+            *) say 'Unsafe archive member type'; return 1 ;;
+        esac
+        case "/$member/" in
+            *//*|*/../*|*/./*|*\\*|*[[:cntrl:]]*) say 'Unsafe archive member path'; return 1 ;;
+        esac
+        printf '%s\n' "$member"
+    done < "$STAGE/members" 8< "$STAGE/details" > "$STAGE/validated" || return 1
+    LC_ALL=C sort -f "$STAGE/validated" | LC_ALL=C uniq -id > "$STAGE/duplicates" || return 1
+    [[ ! -s "$STAGE/duplicates" ]] || { say 'Duplicate archive member'; return 1; }
+    mkdir -- "$dest" || return 1
+    run_interruptible "$reader" --safe-writes --no-same-owner --no-same-permissions --no-acls --no-xattrs --no-fflags \
+        -xf "$archive" -C "$dest"
+}
+
+archive_tool() {
+    local tool version
+    for tool in bsdtar tar; do
+        version=$(LC_ALL=C "$tool" --version 2>/dev/null) || continue
+        if [[ "$version" == bsdtar\ * && "$version" == *liblzma/* ]]; then
+            printf '%s\n' "$tool"
+            return
+        fi
+    done
+    return 1
+}
+
+require_tools() {
+    local tool
+    for tool in "$@"; do
+        command -v "$tool" >/dev/null || die "Missing required tool: $tool"
+    done
+}
+
+lock_data() {
+    plain_dir "$DATA" || die "Unexpected data directory: $DATA"
+    require_tools flock
+    exec 9<"$DATA" || die "Cannot open lock directory: $DATA"
+    flock -n 9 || die 'Cannot acquire zvm lock (another operation may be running)'
+    DATA_LOCKED=yes
+}
+
+ensure_dir() {
+    if ! exists "$1"; then
+        mkdir -p -- "$1" || die "Cannot create $1"
+    fi
+    plain_dir "$1" || die "Unexpected directory: $1"
+}
+
+cleanup() {
+    if [[ -n "$WORKER" ]]; then
+        kill "$WORKER" 2>/dev/null || :
+        wait "$WORKER" 2>/dev/null || :
+    fi
+    local dir
+    for dir in "$STAGE" "$CACHE_STAGE"; do
+        if [[ -n "$dir" ]]; then rm -rf -- "$dir"; fi
+    done
+}
+
+begin_write() {
+    trap cleanup EXIT
+    trap 'say "Interrupted"; exit 130' INT
+    trap 'say "Interrupted"; exit 143' TERM
+    trap 'say "Interrupted"; exit 129' HUP
+}
+
+stage_data() {
+    STAGE=$(mktemp -d "$DATA/.stage.XXXXXXXX") || die 'Cannot stage toolchain'
+}
+
+stage_cache() {
+    if [[ -n "$CACHE_STAGE" ]]; then return; fi
+    ensure_dir "$CACHE"
+    # Data and cache can be configured independently. Always take data first
+    # when both locks are needed, and do not re-lock an identical inode.
+    if [[ "$DATA_LOCKED" != yes || ! "$DATA" -ef "$CACHE" ]]; then
+        exec 7<"$CACHE" || die "Cannot open cache lock directory: $CACHE"
+        flock -n 7 || die 'Cannot acquire zvm cache lock (another operation may be running)'
+    fi
+    CACHE_STAGE=$(mktemp -d "$CACHE/.stage.XXXXXXXX") || die 'Cannot stage download'
+}
+
+# The parent handles TERM while waiting and reaps the worker before cleanup.
+# Keep the lock in the parent so descendants cannot hold it after the worker dies.
+run_interruptible() {
+    "$@" 7<&- 9<&- &
+    WORKER=$!
+    local status=0
+    wait "$WORKER" || status=$?
+    WORKER=''
+    return "$status"
+}
+
+download() {
+    local status=0
+    # -q disables the user's curlrc; even redirects must use HTTPS.
+    run_interruptible curl -qfsSL --proto '=https' --proto-redir '=https' --connect-timeout 20 --max-time 900 \
+        -o "$2" -- "$1" || status=$?
+    if (( status )); then
+        say "Download failed ($status): $1"
+        return 1
+    fi
+}
+
+detect_platform() {
+    local os arch
+    case "$(uname -s)" in
+        Linux) os=linux ;;
+        Darwin) os=macos ;;
+        *) die 'Supported systems: Linux and macOS' ;;
+    esac
+    case "$(uname -m)" in
+        x86_64) arch=x86_64 ;;
+        arm64|aarch64) arch=aarch64 ;;
+        *) die 'Supported architectures: x86_64 and aarch64' ;;
+    esac
+    printf '%s-%s\n' "$arch" "$os"
+}
+
+# Validate build schema before trusting a fresh or cached index. Match the
+# entire string (jq's \z, not $ which also accepts a trailing newline).
+# shellcheck disable=SC2016 # jq variables are positional bindings, not shell variables.
+readonly JQ_BUILDS='
+    def valid_id: type == "string" and test("\\A" + $id + "\\z");
+    def build: type == "object"
+        and (.tarball | type == "string" and test("\\Ahttps://[A-Za-z0-9.-]+/[A-Za-z0-9._+/%-]+\\z"))
+        and (.shasum | type == "string" and test("\\A[0-9a-f]{64}\\z"));
+    def builds: to_entries | all(.[] | select(.key | test("^[a-z0-9_]+-[a-z]+$")); .value | build);
+'
+
+validate_index() {
+    jq -es --arg id "$ID_RE" "$JQ_BUILDS"'
+        length == 1 and (.[0] | type == "object" and length > 0 and
+        all(to_entries[]; .key as $key | (.value | type == "object" and builds) and
+            (if $key == "master" then (.value.version | valid_id and contains("-dev."))
+             else ($key | valid_id) and ((.value.version // $key) == $key) end)))
+    ' "$1" >/dev/null
+}
+
+fresh_index() {
+    local mtime now
+    plain_dir "$CACHE" && plain_file "$CACHE/index.json" || return 1
+    if [[ "$(uname -s)" == Darwin ]]; then
+        mtime=$(stat -f %m "$CACHE/index.json") || return 1
+    else
+        mtime=$(stat -c %Y "$CACHE/index.json") || return 1
+    fi
+    now=$(date +%s) || return 1
+    (( now >= mtime && now - mtime < CACHE_MAX_AGE )) && validate_index "$CACHE/index.json"
+}
+
+fetch_index() {
+    if fresh_index; then return; fi
+    stage_cache
+    # A writer with a different data root may have refreshed it in the meantime.
+    if fresh_index; then return; fi
+    if exists "$CACHE/index.json" && ! plain_file "$CACHE/index.json"; then
+        die "Unexpected index path: $CACHE/index.json"
+    fi
+    download "$INDEX_URL" "$CACHE_STAGE/index.part" || die 'Cannot fetch Zig index'
+    validate_index "$CACHE_STAGE/index.part" || die 'Invalid Zig index; previous cache retained'
+    replace_path "$CACHE_STAGE/index.part" "$CACHE/index.json" || die 'Cannot publish Zig index'
+}
+
+# Numeric ordering without GNU sort -V. At equal base, stable sorts ahead of dev.
+readonly JQ_ORDER='
+    def order: capture("^(?<a>[0-9]+)\\.(?<b>[0-9]+)\\.(?<c>[0-9]+)(-dev\\.(?<n>[0-9]+)\\+(?<sha>[a-f0-9]+))?$") |
+        [.a,.b,.c,.n] | map(if . == null then [1] else [0,length,.] end);
+'
+
+resolve_version() {
+    jq -er --arg p "$PLATFORM" --arg spec "$1" "$JQ_ORDER"'
+        [to_entries[] | (.value.version // .key) as $id |
+            select(.value[$p] != null) | {id: $id, key, build: .value[$p]}] |
+        (if $spec == "latest" then map(select(.id | contains("-dev.") | not)) | max_by(.id | order)
+         else map(select(.key == $spec or .id == $spec)) | first end) |
+        select(. != null) | [.id,.build.tarball,.build.shasum] | @tsv
+    ' "$CACHE/index.json"
+}
+
+sha256() {
+    if command -v sha256sum >/dev/null; then sha256sum
+    elif command -v shasum >/dev/null; then shasum -a 256
+    else say 'Missing required SHA-256 tool: sha256sum or shasum'; return 1; fi
+}
+
+require_download_tools() {
+    require_tools curl jq
+    command -v sha256sum >/dev/null || command -v shasum >/dev/null || die 'Missing required SHA-256 tool: sha256sum or shasum'
+    archive_tool >/dev/null || die 'Missing required tool: BSD tar with XZ support'
+}
+
+verify_checksum() {
+    local actual
+    # Hash stdin so names containing spaces or backslashes cannot affect parsing.
+    actual=$(sha256 < "$1") || return 1
+    [[ "${actual%% *}" == "$2" ]]
+}
+
+# Print only the verified pathname. Call in the parent (redirect stdout to a
+# private result file) so interruption traps can reap the active transfer.
+ensure_cached_archive() {
+    local url="$1" digest="$2" archive
+    [[ "$digest" =~ ^[a-f0-9]{64}$ && "$url" == https://* ]] || return 1
+    stage_cache
+    ensure_dir "$CACHE/downloads"
+    archive="$CACHE/downloads/$digest.tar.xz"
+    if exists "$archive"; then
+        plain_file "$archive" || die "Unexpected archive path: $archive"
+        if verify_checksum "$archive" "$digest"; then
+            printf '%s\n' "$archive"
+            return
+        fi
+        rm -- "$archive" || die 'Cannot discard corrupt cache entry'
+    fi
+    download "$url" "$CACHE_STAGE/archive.part" || return 1
+    if ! verify_checksum "$CACHE_STAGE/archive.part" "$digest"; then
+        rm -f -- "$CACHE_STAGE/archive.part"
+        say "Checksum mismatch: $url"
+        return 1
+    fi
+    replace_path "$CACHE_STAGE/archive.part" "$archive" || return 1
+    printf '%s\n' "$archive"
+}
+
+managed() {
+    local id="$1" dir="$VERSIONS/$1"
+    valid_id "$id" && plain_dir "$DATA" && plain_dir "$VERSIONS" && plain_dir "$dir" &&
+        plain_file "$dir/.zvm-managed" && plain_file "$dir/zig" && [[ -x "$dir/zig" ]] &&
+        plain_dir "$dir/lib" && printf 'zvm-toolchain-v1 %s\n' "$id" | cmp -s "$dir/.zvm-managed" -
+}
+
+get_current_version() {
+    local target
+    exists "$CURRENT" || return 1
+    if plain_dir "$DATA" && [[ -L "$CURRENT" ]] && target=$(link_target "$CURRENT") &&
+        [[ "$target" == versions/* ]]; then
+        target="${target#versions/}"
+        target="${target%.}"
+        if managed "$target"; then
+            printf '%s\n' "$target"
+            return 0
+        fi
+    fi
+    say 'Unrecognized current selection (possibly legacy); see README for reinstall instructions'
+    return 2
+}
+
+load_selection() {
+    local rc=0
+    SELECTED=$(get_current_version) || rc=$?
+    (( rc < 2 )) || die 'Refusing to modify an unrecognized selection'
+}
+
+require_installed() {
+    local id="$1"
+    if managed "$id"; then return; fi
+    if exists "$VERSIONS/$id"; then
+        die "Unmanaged or legacy toolchain: $VERSIONS/$id (see README)"
+    fi
+    die "Zig $id is not installed; run: zvm install --use $id"
+}
+
+ensure_zig_installed() {
+    local id="$1" url="$2" digest="$3" archive actual
+    local -a entries
+    ZIG_DIR="$VERSIONS/$id"
+    if managed "$id"; then return; fi
+    ! exists "$ZIG_DIR" || die "Unmanaged or legacy toolchain: $ZIG_DIR (see README)"
+    ensure_cached_archive "$url" "$digest" > "$STAGE/archive-path" || return 1
+    IFS= read -r archive < "$STAGE/archive-path" || return 1
+    extract_archive "$archive" "$STAGE/zig" || return 1
+    entries=("$STAGE/zig"/*)
+    [[ ${#entries[@]} == 1 ]] && plain_dir "${entries[0]}" || return 1
+    ZIG_DIR="${entries[0]}"
+    plain_dir "$ZIG_DIR/lib" && plain_file "$ZIG_DIR/zig" && [[ -x "$ZIG_DIR/zig" ]] || return 1
+    ! exists "$ZIG_DIR/.zvm-managed" && ! exists "$ZIG_DIR/zls" || return 1
+    actual=$("$ZIG_DIR/zig" version) && [[ "$actual" == "$id" ]] || return 1
+    printf 'zvm-toolchain-v1 %s\n' "$id" > "$ZIG_DIR/.zvm-managed"
+}
+
+has_zls() { plain_file "$1/zls" && [[ -x "$1/zls" ]]; }
+
+# Return 3 only for a recognized unsupported response or absent platform.
+ensure_zls_installed() {
+    local id="$1" dir="$2" metadata url digest archive
+    ZLS_PAYLOAD=''
+    if has_zls "$dir"; then return; fi
+    ! exists "$dir/zls" || die "Unexpected ZLS path: $dir/zls"
+    require_download_tools
+    download "$ZLS_URL?zig_version=${id/+/%2B}&compatibility=full" "$STAGE/zls.json" || return 1
+    metadata=$(jq -ers --arg id "$ID_RE" --arg p "$PLATFORM" "$JQ_BUILDS"'
+        if length != 1 then error("expected one ZLS response") else .[0] end |
+        if type != "object" then error("invalid ZLS response")
+        elif .code == 0 and (.message | type == "string" and endswith("is not supported by ZLS")) then "unsupported"
+        elif (.version | valid_id) and builds then
+            if has($p) then [.[$p].tarball,.[$p].shasum] | @tsv else "unsupported" end
+        else error("invalid ZLS metadata") end
+    ' "$STAGE/zls.json") || return 1
+    if [[ "$metadata" == unsupported ]]; then return 3; fi
+    IFS=$'\t' read -r url digest <<< "$metadata"
+    ensure_cached_archive "$url" "$digest" > "$STAGE/archive-path" || return 1
+    IFS= read -r archive < "$STAGE/archive-path" || return 1
+    extract_archive "$archive" "$STAGE/zls" || return 1
+    has_zls "$STAGE/zls" || return 1
+    "$STAGE/zls/zls" --version >&2 || return 1
+    ZLS_PAYLOAD="$STAGE/zls/zls"
+}
+
+owned_link() { [[ -L "$BIN/$1" && "$(link_target "$BIN/$1")" == "$CURRENT/$1." ]]; }
+
+check_bin() {
+    if exists "$HOME/.local"; then plain_dir "$HOME/.local" || die 'Unexpected ~/.local directory'; fi
+    if exists "$BIN"; then plain_dir "$BIN" || die "Unexpected bin directory: $BIN"; fi
+}
+
+check_link() {
+    if exists "$BIN/$1" && ! owned_link "$1"; then
+        die "Refusing to replace unrelated path: $BIN/$1"
+    fi
+}
+
+warn_path() {
+    local tool found
+    if [[ ":${PATH:-}:" != *":$BIN:"* ]]; then
+        say "Add $BIN to PATH to use the selected toolchain."
+    else
+        for tool in "$@"; do
+            found=$(type -P "$tool") || continue
+            if [[ "$found" != "$BIN/$tool" ]]; then say "PATH resolves $tool to $found before zvm."; fi
+        done
+    fi
+}
+
+activate_version() {
+    local id="$1"
+    local -a tools=(zig)
+    require_installed "$id"
+    check_bin
+    check_link zig
+    if has_zls "$VERSIONS/$id"; then
+        check_link zls
+        tools+=(zls)
+    elif exists "$VERSIONS/$id/zls"; then
+        die "Unexpected ZLS path: $VERSIONS/$id/zls"
+    fi
+    ensure_dir "$BIN"
+    ln -s "versions/$id" "$STAGE/current" || die 'Cannot stage selection'
+    commit_selection "$STAGE/current" "$CURRENT" replace "${tools[@]}" || die "Cannot select $id"
+    warn_path "${tools[@]}"
+}
+
+# A previously created ZLS link may dangle, but always follows current, never
+# the previous Zig. Unset removes only links whose exact target we own.
+clear_selection() {
+    if [[ -n "$SELECTED" ]]; then rm -- "$CURRENT" || die 'Cannot clear selection'; fi
+    # No owned links can be reached through an unrecognized bin directory.
+    if ! plain_dir "$HOME/.local" || ! plain_dir "$BIN"; then return 0; fi
+    local tool
+    for tool in zig zls; do
+        if owned_link "$tool"; then rm -- "$BIN/$tool" || die "Cannot unlink $tool"; fi
+    done
+}
+
+read_pin() {
+    local line pin=''
+    [[ -f .zvmrc ]] || return 1
+    # shellcheck disable=SC2094 # Both commands only read the pin.
+    LC_ALL=C tr -d '\000' < .zvmrc | cmp -s .zvmrc - || { say 'Invalid .zvmrc'; return 1; }
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        case "$line" in ''|\#*) continue ;; esac
+        [[ -z "$pin" ]] || die '.zvmrc must contain a single version spec'
+        pin="$line"
+    done < .zvmrc
+    [[ -n "$pin" ]] || return 1
+    printf '%s\n' "$pin"
+}
+
+cmd_install() {
+    local spec='' select=no with_zls=yes id url digest resolved rc=0
+    while (( $# )); do
+        case "$1" in
+            --use) [[ "$select" == no ]] || die 'Duplicate --use'; select=yes ;;
+            --no-zls) [[ "$with_zls" == yes ]] || die 'Duplicate --no-zls'; with_zls=no ;;
+            -*|'') die "Unexpected install argument: $1" ;;
+            *) [[ -z "$spec" ]] || die 'Expected one install spec'; spec="$1" ;;
+        esac
+        shift
+    done
+    if [[ -z "$spec" ]]; then spec=$(read_pin) || die 'Usage: zvm install [SPEC] [--use] [--no-zls] (or set .zvmrc)'; fi
+    valid_id "$spec" || [[ "$spec" == latest || "$spec" == master ]] || die "Invalid install spec: $spec"
+    require_tools flock
+    begin_write
+    ensure_dir "$DATA"
+    lock_data
+    load_selection
+    ensure_dir "$VERSIONS"
+    stage_data
+    if managed "$spec"; then
+        id="$spec"
+        ZIG_DIR="$VERSIONS/$id"
+    else
+        if valid_id "$spec" && exists "$VERSIONS/$spec"; then
+            die "Unmanaged or legacy toolchain: $VERSIONS/$spec (see README)"
+        fi
+        require_download_tools
+        PLATFORM=$(detect_platform) || exit 1
+        fetch_index
+        resolved=$(resolve_version "$spec") || die "No verified $PLATFORM build found for $spec"
+        IFS=$'\t' read -r id url digest <<< "$resolved"
+        valid_id "$id" || die 'Invalid resolved version ID'
+        ensure_zig_installed "$id" "$url" "$digest" || die "Cannot install Zig $id (check archive and distribution layout)"
+    fi
+    if [[ "$with_zls" == yes ]] && ! has_zls "$ZIG_DIR"; then
+        PLATFORM=$(detect_platform) || exit 1
+        ensure_zls_installed "$id" "$ZIG_DIR" || rc=$?
+        case "$rc" in
+            0) publish_zls "$id" "$ZIG_DIR" ;;
+            3) say "Compatible ZLS not available for Zig $id ($PLATFORM)" ;;
+            *) die "Cannot install ZLS for Zig $id" ;;
+        esac
+    fi
+    if [[ "$ZIG_DIR" != "$VERSIONS/$id" ]]; then
+        publish_new "$ZIG_DIR" "$VERSIONS/$id" || die "Cannot publish Zig $id"
+    fi
+    if [[ "$select" == yes ]]; then activate_version "$id"; fi
+    say "Zig $id is installed."
+}
+
+publish_zls() {
+    local id="$1" dir="$2"
+    if [[ "$id" == "$SELECTED" ]]; then
+        check_bin
+        check_link zls
+        ensure_dir "$BIN"
+        if [[ -n "$ZLS_PAYLOAD" ]]; then
+            commit_selection "$ZLS_PAYLOAD" "$dir/zls" new zls || die 'Cannot publish ZLS'
+        else
+            commit_selection '' '' links zls || die 'Cannot link ZLS'
+        fi
+        warn_path zls
+    elif [[ -n "$ZLS_PAYLOAD" ]]; then
+        publish_new "$ZLS_PAYLOAD" "$dir/zls" || die 'Cannot publish ZLS'
+    fi
+}
+
+cmd_zls() {
+    [[ $# -ge 1 && $# -le 2 && "$1" == install ]] || die 'Usage: zvm zls install [VERSION]'
+    if (( $# == 2 )); then valid_id "$2" || die "Invalid version: $2"; fi
+    local id rc=0
+    plain_dir "$DATA" || die 'No managed Zig installations'
+    lock_data
+    load_selection
+    id="${2:-$SELECTED}"
+    [[ -n "$id" ]] || die 'No selection; specify a concrete installed version'
+    require_installed "$id"
+    begin_write
+    stage_data
+    if ! has_zls "$VERSIONS/$id"; then
+        PLATFORM=$(detect_platform) || exit 1
+    fi
+    ensure_zls_installed "$id" "$VERSIONS/$id" || rc=$?
+    case "$rc" in
+        0) publish_zls "$id" "$VERSIONS/$id" ;;
+        3) die "Compatible ZLS not available for Zig $id ($PLATFORM)" ;;
+        *) die "Cannot install ZLS for Zig $id" ;;
+    esac
+}
+
+cmd_use() {
+    (( $# <= 1 )) || die 'Usage: zvm use [VERSION]'
+    local id
+    if (( $# )); then id="$1"; else id=$(read_pin) || die 'Usage: zvm use [VERSION] (or set .zvmrc)'; fi
+    valid_id "$id" || die "Expected a concrete Zig version: $id"
+    require_installed "$id"
+    lock_data
+    load_selection
+    begin_write
+    stage_data
+    activate_version "$id"
+}
+
+cmd_unset() {
+    (( $# == 0 )) || die 'Usage: zvm unset'
+    if ! exists "$DATA"; then return; fi
+    lock_data
+    load_selection
+    clear_selection
+}
+
+managed_ids() {
+    local path
+    if plain_dir "$DATA" && plain_dir "$VERSIONS"; then
+        for path in "$VERSIONS"/*; do
+            if managed "${path##*/}"; then printf '%s\n' "${path##*/}"; fi
+        done
+    fi
+}
+
+cmd_list() {
+    local id ids selected rc=0
+    case $# in
+        0)
+            selected=$(get_current_version) || rc=$?
+            (( rc < 2 )) || return "$rc"
+            ids=$(managed_ids | LC_ALL=C sort -t. -k1,1nr -k2,2nr -k3,3nr -k3,3 -k4,4nr)
+            while IFS= read -r id; do
+                [[ -n "$id" ]] || continue
+                if [[ "$id" == "$selected" ]]; then printf '* %s\n' "$id"; else printf '  %s\n' "$id"; fi
+            done <<< "$ids"
+            ;;
+        1)
+            [[ "$1" == --remote ]] || die 'Usage: zvm list [--remote]'
+            require_tools jq
+            PLATFORM=$(detect_platform) || exit 1
+            if ! fresh_index; then
+                require_tools flock curl
+                begin_write
+                fetch_index
+            fi
+            jq -r --arg p "$PLATFORM" "$JQ_ORDER"'
+                [to_entries[] | select(.value[$p] != null) | (.value.version // .key)] |
+                sort_by([order,.]) | reverse[] |
+                if contains("-dev.") then "dev " + . else "stable " + . end
+            ' "$CACHE/index.json"
+            ;;
+        *) die 'Usage: zvm list [--remote]' ;;
+    esac
+}
+
+# Private, read-only completion protocol: ID<TAB>description, no headers.
+cmd_complete() {
+    [[ $# == 1 ]] || return 1
+    case "$1" in installed|inactive|installable) ;; *) return 1 ;; esac
+    local id selected platform cached=''
+    selected=$(get_current_version 2>/dev/null) || selected=''
+    if [[ "$1" == installable ]] && command -v jq >/dev/null &&
+        plain_dir "$CACHE" && plain_file "$CACHE/index.json" && validate_index "$CACHE/index.json" 2>/dev/null &&
+        platform=$(detect_platform 2>/dev/null); then
+        cached=$(jq -r --arg p "$platform" '
+            to_entries[] | select(.value[$p] != null) | (.value.version // .key)
+        ' "$CACHE/index.json" 2>/dev/null) || cached=''
+    fi
+    {
+        managed_ids
+        if [[ -n "$cached" ]]; then printf '%s\n' "$cached"; fi
+    } | LC_ALL=C sort -u | while IFS= read -r id; do
+        if [[ "$id" == "$selected" ]]; then
+            if [[ "$1" != inactive ]]; then printf '%s\tselected\n' "$id"; fi
+        else
+            printf '%s\t\n' "$id"
+        fi
+    done
+}
+
+remove_version() {
+    managed "$1" || die "Not a managed toolchain: $1"
+    rm -rf -- "${VERSIONS:?}/${1:?}" || die "Cannot remove Zig $1"
+}
+
+cmd_uninstall() {
+    local id ids answer all=no yes=no
+    case $# in
+        1) if [[ "$1" == --all ]]; then all=yes; else valid_id "$1" || die 'Expected a concrete Zig version or --all'; fi ;;
+        2) case "$1 $2" in '--all --yes') all=yes; yes=yes ;; *) die 'Usage: zvm uninstall VERSION | --all [--yes]' ;; esac ;;
+        *) die 'Usage: zvm uninstall VERSION | --all [--yes]' ;;
+    esac
+    if [[ "$all" == yes ]] && ! exists "$DATA"; then return; fi
+    if [[ "$all" == no ]]; then require_installed "$1"; fi
+    lock_data
+    if [[ "$all" == no ]]; then
+        load_selection
+        [[ "$1" != "$SELECTED" ]] || die 'Version is selected; run zvm unset or switch first'
+        remove_version "$1"
+        return
+    fi
+    ids=$(managed_ids)
+    [[ -n "$ids" ]] || return 0
+    load_selection
+    say "Managed toolchains to remove:"
+    say "$ids"
+    if [[ "$yes" != yes ]]; then
+        [[ -t 0 ]] || die 'Without a TTY, pass --yes to confirm removal'
+        printf 'Remove these Zig and bundled ZLS installations? [y/N] ' >&2
+        if ! IFS= read -r answer || [[ ! "$answer" =~ ^([yY]|[yY][eE][sS])$ ]]; then
+            say 'Cancelled.'
+            return
+        fi
+    fi
+    clear_selection
+    while IFS= read -r id; do remove_version "$id"; done <<< "$ids"
+}
+
+cmd_help() {
+    printf '%s\n' \
+        'Usage: zvm COMMAND' \
+        '  install [SPEC] [--use] [--no-zls]   Install Zig; select only with --use' \
+        '  use [VERSION]                     Select an installed version offline' \
+        '  unset                             Clear selection' \
+        '  current                           Print the selected version' \
+        '  list [--remote]                   List installed or available versions' \
+        '  uninstall VERSION                 Remove one inactive installation' \
+        '  uninstall --all [--yes]           Remove all managed installations' \
+        '  zls install [VERSION]             Add ZLS (defaults to selected Zig)' \
+        '  --version                         Print the manager version' \
+        '  --help                            Show usage' \
+        '' \
+        'Quick start: zvm install --use latest' \
+        'SPEC is an exact version, latest (stable), or master. Only install and' \
+        'use without a positional argument read .zvmrc in the working directory.'
+}
+
+main() {
+    local cmd="${1---help}"
+    (( BASH_VERSINFO[0] > 3 || (BASH_VERSINFO[0] == 3 && BASH_VERSINFO[1] >= 2) )) || die 'Bash 3.2 or newer required'
+    if (( $# )); then shift; fi
+    case "$cmd" in
+        --help) (( $# == 0 )) || die 'Unexpected arguments to --help'; cmd_help; return ;;
+        --version) (( $# == 0 )) || die 'Unexpected arguments to --version'; printf '%s\n' "$VERSION"; return ;;
+    esac
+    [[ -n "${HOME:-}" && "$HOME" == /* ]] || die 'HOME must be an absolute path'
+    local data_home="${XDG_DATA_HOME:-}" cache_home="${XDG_CACHE_HOME:-}"
+    [[ "$data_home" == /* ]] || data_home="$HOME/.local/share"
+    [[ "$cache_home" == /* ]] || cache_home="$HOME/.cache"
+    DATA="${data_home%/}/zvm"
+    VERSIONS="$DATA/versions"
+    CURRENT="$DATA/current"
+    CACHE="${cache_home%/}/zvm"
+    BIN="${HOME%/}/.local/bin"
+    STAGE='' CACHE_STAGE='' WORKER='' PLATFORM='' SELECTED='' ZIG_DIR='' ZLS_PAYLOAD='' DATA_LOCKED=no
+    case "$DATA$CACHE$BIN" in *[[:cntrl:]]*) die 'HOME and XDG paths must not contain control characters' ;; esac
+    export LC_ALL=C
+    umask 022
+    shopt -s dotglob
+    case "$cmd" in
+        install) cmd_install "$@" ;;
+        use) cmd_use "$@" ;;
+        unset) cmd_unset "$@" ;;
+        current) (( $# == 0 )) || die 'Usage: zvm current'; get_current_version ;;
+        list) cmd_list "$@" ;;
+        uninstall) cmd_uninstall "$@" ;;
+        zls) cmd_zls "$@" ;;
+        __complete) cmd_complete "$@" ;;
+        *) die "Unknown command: $cmd (see zvm --help)" ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

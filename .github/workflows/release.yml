@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-tag:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Verify the annotated tag against the pinned release key
+        shell: bash
+        env:
+          RELEASE_GPG_FINGERPRINT: ${{ vars.RELEASE_GPG_FINGERPRINT }}
+        run: |
+          git fetch --no-tags origin "$GITHUB_REF"
+          test "$(git cat-file -t FETCH_HEAD)" = tag
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$(git rev-parse HEAD)"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "$GITHUB_SHA^{commit}")"
+          test "$(git cat-file tag FETCH_HEAD | head -n 3 | tail -n 1)" = "tag $GITHUB_REF_NAME"
+          if [[ ! "${RELEASE_GPG_FINGERPRINT:-}" =~ ^([0-9A-F]{40}|[0-9A-F]{64})$ ]]; then
+            printf '%s\n' 'Set RELEASE_GPG_FINGERPRINT to the uppercase primary key fingerprint.' >&2
+            exit 1
+          fi
+          work=$(mktemp -d)
+          trap 'rm -rf -- "$work"' EXIT
+          mkdir -m 700 "$work/fetched" "$work/verify"
+          curl -qfsS --proto '=https' --connect-timeout 20 --max-time 60 \
+            -o "$work/aarvay.gpg" https://github.com/aarvay.gpg
+          gpg --homedir "$work/fetched" --batch --import "$work/aarvay.gpg"
+          gpg --homedir "$work/fetched" --batch --export "$RELEASE_GPG_FINGERPRINT" > "$work/pinned.gpg"
+          test -s "$work/pinned.gpg"
+          export GNUPGHOME="$work/verify"
+          gpg --batch --import "$work/pinned.gpg"
+          gpg --batch --with-colons --list-keys > "$work/keys"
+          printf '%s\n' "$RELEASE_GPG_FINGERPRINT" > "$work/expected"
+          awk -F: '$1 == "pub" { primary = 1; next } $1 == "fpr" && primary { print $10; primary = 0 }' \
+            "$work/keys" | cmp - "$work/expected"
+          git -c gpg.format=openpgp -c gpg.openpgp.program=gpg verify-tag FETCH_HEAD
+
+  ci:
+    needs: verify-tag
+    uses: ./.github/workflows/ci.yml
+
+  upstream:
+    needs: verify-tag
+    uses: ./.github/workflows/upstream.yml
+
+  release:
+    needs: [ci, upstream]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build and test exact tag
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libarchive-tools
+          /bin/bash scripts/build-release.sh "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" assets
+          /bin/bash tests/installer.sh assets
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: 'assets/*'
+      - name: Create draft and verify the uploaded assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --generate-notes assets/*
+          gh release download "$GITHUB_REF_NAME" --dir downloaded
+          for file in assets/*; do cmp "$file" "downloaded/${file##*/}"; done
+          /bin/bash tests/installer.sh downloaded
+          gh attestation verify downloaded/SHA256SUMS --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-ref "$GITHUB_REF"
+          test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = true
