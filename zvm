@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then set -euo pipefail; fi
 
-readonly VERSION=1.0.0
+readonly VERSION=1.0.1
 readonly ID_RE='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-dev\.(0|[1-9][0-9]*)\+[a-f0-9]{1,40})?'
 readonly INDEX_URL=https://ziglang.org/download/index.json
 readonly ZLS_URL=https://releases.zigtools.org/v1/zls/select-version
@@ -148,22 +148,35 @@ ensure_dir() {
     plain_dir "$1" || die "Unexpected directory: $1"
 }
 
-cleanup() {
+stop_worker() {
     if [[ -n "$WORKER" ]]; then
         kill "$WORKER" 2>/dev/null || :
         wait "$WORKER" 2>/dev/null || :
+        WORKER=''
     fi
+}
+
+cleanup() {
+    stop_worker
     local dir
     for dir in "$STAGE" "$CACHE_STAGE"; do
         if [[ -n "$dir" ]]; then rm -rf -- "$dir"; fi
     done
 }
 
+interrupt() {
+    stop_worker
+    # A cancelled curl may leave the cursor mid-bar.
+    if [[ "$DOWNLOAD_DISPLAY" == --progress-bar ]]; then say ''; fi
+    say 'Interrupted'
+    exit "$1"
+}
+
 begin_write() {
     trap cleanup EXIT
-    trap 'say "Interrupted"; exit 130' INT
-    trap 'say "Interrupted"; exit 143' TERM
-    trap 'say "Interrupted"; exit 129' HUP
+    trap 'interrupt 130' INT
+    trap 'interrupt 143' TERM
+    trap 'interrupt 129' HUP
 }
 
 stage_data() {
@@ -195,9 +208,14 @@ run_interruptible() {
 
 download() {
     local status=0
+    DOWNLOAD_DISPLAY=--silent
+    if [[ "${3:-}" == progress && -t 2 && "${TERM:-}" != dumb ]]; then
+        DOWNLOAD_DISPLAY=--progress-bar
+    fi
     # -q disables the user's curlrc; even redirects must use HTTPS.
-    run_interruptible curl -qfsSL --proto '=https' --proto-redir '=https' --connect-timeout 20 --max-time 900 \
-        -o "$2" -- "$1" || status=$?
+    run_interruptible curl -q -fSL "$DOWNLOAD_DISPLAY" --proto '=https' --proto-redir '=https' \
+        --connect-timeout 20 --max-time 900 -o "$2" -- "$1" || status=$?
+    DOWNLOAD_DISPLAY=''
     if (( status )); then
         say "Download failed ($status): $1"
         return 1
@@ -302,20 +320,24 @@ verify_checksum() {
 # Print only the verified pathname. Call in the parent (redirect stdout to a
 # private result file) so interruption traps can reap the active transfer.
 ensure_cached_archive() {
-    local url="$1" digest="$2" archive
+    local url="$1" digest="$2" label="$3" archive
     [[ "$digest" =~ ^[a-f0-9]{64}$ && "$url" == https://* ]] || return 1
     stage_cache
     ensure_dir "$CACHE/downloads"
     archive="$CACHE/downloads/$digest.tar.xz"
     if exists "$archive"; then
         plain_file "$archive" || die "Unexpected archive path: $archive"
+        say "Verifying cached $label archive..."
         if verify_checksum "$archive" "$digest"; then
             printf '%s\n' "$archive"
             return
         fi
+        say "Discarding corrupt $label cache entry."
         rm -- "$archive" || die 'Cannot discard corrupt cache entry'
     fi
-    download "$url" "$CACHE_STAGE/archive.part" || return 1
+    say "Downloading $label..."
+    download "$url" "$CACHE_STAGE/archive.part" progress || return 1
+    say "Verifying $label archive..."
     if ! verify_checksum "$CACHE_STAGE/archive.part" "$digest"; then
         rm -f -- "$CACHE_STAGE/archive.part"
         say "Checksum mismatch: $url"
@@ -369,8 +391,9 @@ ensure_zig_installed() {
     ZIG_DIR="$VERSIONS/$id"
     if managed "$id"; then return; fi
     ! exists "$ZIG_DIR" || die "Unmanaged or legacy toolchain: $ZIG_DIR (see README)"
-    ensure_cached_archive "$url" "$digest" > "$STAGE/archive-path" || return 1
+    ensure_cached_archive "$url" "$digest" "Zig $id" > "$STAGE/archive-path" || return 1
     IFS= read -r archive < "$STAGE/archive-path" || return 1
+    say "Extracting Zig $id..."
     extract_archive "$archive" "$STAGE/zig" || return 1
     entries=("$STAGE/zig"/*)
     [[ ${#entries[@]} == 1 ]] && plain_dir "${entries[0]}" || return 1
@@ -385,27 +408,29 @@ has_zls() { plain_file "$1/zls" && [[ -x "$1/zls" ]]; }
 
 # Return 3 only for a recognized unsupported response or absent platform.
 ensure_zls_installed() {
-    local id="$1" dir="$2" metadata url digest archive
+    local id="$1" dir="$2" metadata version url digest archive
     ZLS_PAYLOAD=''
     if has_zls "$dir"; then return; fi
     ! exists "$dir/zls" || die "Unexpected ZLS path: $dir/zls"
     require_download_tools
+    say "Checking ZLS compatibility for Zig $id..."
     download "$ZLS_URL?zig_version=${id/+/%2B}&compatibility=full" "$STAGE/zls.json" || return 1
     metadata=$(jq -ers --arg id "$ID_RE" --arg p "$PLATFORM" "$JQ_BUILDS"'
         if length != 1 then error("expected one ZLS response") else .[0] end |
         if type != "object" then error("invalid ZLS response")
         elif .code == 0 and (.message | type == "string" and endswith("is not supported by ZLS")) then "unsupported"
         elif (.version | valid_id) and builds then
-            if has($p) then [.[$p].tarball,.[$p].shasum] | @tsv else "unsupported" end
+            if has($p) then [.version,.[$p].tarball,.[$p].shasum] | @tsv else "unsupported" end
         else error("invalid ZLS metadata") end
     ' "$STAGE/zls.json") || return 1
     if [[ "$metadata" == unsupported ]]; then return 3; fi
-    IFS=$'\t' read -r url digest <<< "$metadata"
-    ensure_cached_archive "$url" "$digest" > "$STAGE/archive-path" || return 1
+    IFS=$'\t' read -r version url digest <<< "$metadata"
+    ensure_cached_archive "$url" "$digest" "ZLS $version" > "$STAGE/archive-path" || return 1
     IFS= read -r archive < "$STAGE/archive-path" || return 1
+    say "Extracting ZLS $version..."
     extract_archive "$archive" "$STAGE/zls" || return 1
     has_zls "$STAGE/zls" || return 1
-    "$STAGE/zls/zls" --version >&2 || return 1
+    "$STAGE/zls/zls" --version > /dev/null || return 1
     ZLS_PAYLOAD="$STAGE/zls/zls"
 }
 
@@ -509,12 +534,14 @@ cmd_install() {
         fi
         require_download_tools
         PLATFORM=$(detect_platform) || exit 1
+        say "Resolving Zig $spec for $PLATFORM..."
         fetch_index
         resolved=$(resolve_version "$spec") || die "No verified $PLATFORM build found for $spec"
         IFS=$'\t' read -r id url digest <<< "$resolved"
         valid_id "$id" || die 'Invalid resolved version ID'
         ensure_zig_installed "$id" "$url" "$digest" || die "Cannot install Zig $id (check archive and distribution layout)"
     fi
+    if [[ "$ZIG_DIR" == "$VERSIONS/$id" ]]; then say "Zig $id is already installed."; fi
     if [[ "$with_zls" == yes ]] && ! has_zls "$ZIG_DIR"; then
         PLATFORM=$(detect_platform) || exit 1
         ensure_zls_installed "$id" "$ZIG_DIR" || rc=$?
@@ -526,9 +553,13 @@ cmd_install() {
     fi
     if [[ "$ZIG_DIR" != "$VERSIONS/$id" ]]; then
         publish_new "$ZIG_DIR" "$VERSIONS/$id" || die "Cannot publish Zig $id"
+        say "Installed Zig $id."
     fi
-    if [[ "$select" == yes ]]; then activate_version "$id"; fi
-    say "Zig $id is installed."
+    if [[ -n "$ZLS_PAYLOAD" ]]; then say "Installed ZLS for Zig $id."; fi
+    if [[ "$select" == yes ]]; then
+        activate_version "$id"
+        say "Selected Zig $id."
+    fi
 }
 
 publish_zls() {
@@ -565,7 +596,14 @@ cmd_zls() {
     fi
     ensure_zls_installed "$id" "$VERSIONS/$id" || rc=$?
     case "$rc" in
-        0) publish_zls "$id" "$VERSIONS/$id" ;;
+        0)
+            publish_zls "$id" "$VERSIONS/$id"
+            if [[ -n "$ZLS_PAYLOAD" ]]; then
+                say "Installed ZLS for Zig $id."
+            else
+                say "ZLS is already installed for Zig $id."
+            fi
+            ;;
         3) die "Compatible ZLS not available for Zig $id ($PLATFORM)" ;;
         *) die "Cannot install ZLS for Zig $id" ;;
     esac
@@ -731,7 +769,7 @@ main() {
     CURRENT="$DATA/current"
     CACHE="${cache_home%/}/zvm"
     BIN="${HOME%/}/.local/bin"
-    STAGE='' CACHE_STAGE='' WORKER='' PLATFORM='' SELECTED='' ZIG_DIR='' ZLS_PAYLOAD='' DATA_LOCKED=no
+    STAGE='' CACHE_STAGE='' WORKER='' DOWNLOAD_DISPLAY='' PLATFORM='' SELECTED='' ZIG_DIR='' ZLS_PAYLOAD='' DATA_LOCKED=no
     case "$DATA$CACHE$BIN" in *[[:cntrl:]]*) die 'HOME and XDG paths must not contain control characters' ;; esac
     export LC_ALL=C
     umask 022

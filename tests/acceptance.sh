@@ -11,6 +11,7 @@ trap 'if [[ -n "$child" ]]; then kill "$child" 2>/dev/null || :; wait "$child" 2
 fixture "$tmp/work space"
 cd "$HOME"
 run() { "$DRIVER" "$ZVM" "$@"; }
+export ZVM_PATH="$ZVM" ZVM_TEST_BASH="$DRIVER"
 bad() {
     local message="$1"; shift
     if run "$@" < /dev/null > "$tmp/out" 2> "$tmp/err"; then fail_test "unexpected success: $*"; fi
@@ -45,7 +46,15 @@ bad 'Invalid install spec' install
 
 # Install, offline selection with no download tools, exact override and switch.
 printf '# Pin\n  %s  \n' "$A" > .zvmrc
-run install --no-zls
+run install --no-zls > "$tmp/out" 2> "$tmp/err"
+[[ ! -s "$tmp/out" ]]
+for line in "Resolving Zig $A for $TARGET..." "Downloading Zig $A..." "Verifying Zig $A archive..." \
+    "Extracting Zig $A..." "Installed Zig $A."; do
+    grep -Fx -- "$line" "$tmp/err" || fail_test "missing install status: $line"
+done
+if grep -qF -- '--progress-bar' "$FIXTURE/requests" || grep -q '[[:cntrl:]]' "$tmp/err"; then
+    fail_test 'interactive progress in redirected install'
+fi
 bad '' current
 [[ ! -e "$TEST_BIN/zig" && -x "$VERSIONS/$A/zig" && -f "$VERSIONS/$A/lib/std.zig" ]]
 cp "$FIXTURE/requests" "$tmp/requests"
@@ -56,7 +65,22 @@ cmp "$tmp/requests" "$FIXTURE/requests"
 selected "$A"
 bad "zvm install --use $B" use "$B"
 rm "$FIXTURE/offline"
-run install "$B" --no-zls
+# A terminal on stderr alone is enough to show the archive meter.
+export ZVM_TEST_INSTALL="$B" ZVM_TEST_OUT="$tmp/out"
+expect <<'TCL'
+set timeout 10
+set env(TERM) xterm
+spawn -noecho $env(ZVM_TEST_BASH) -c {exec "$0" "$1" install "$2" --no-zls </dev/null >"$3"} $env(ZVM_TEST_BASH) $env(ZVM_PATH) $env(ZVM_TEST_INSTALL) $env(ZVM_TEST_OUT)
+expect {
+    -exact "Downloading Zig $env(ZVM_TEST_INSTALL)..." {}
+    timeout { exit 1 }
+    eof { exit 1 }
+}
+expect eof
+exit [lindex [wait] 3]
+TCL
+[[ ! -s "$tmp/out" ]]
+grep -F -- '--progress-bar' "$FIXTURE/requests" | grep -F -- "/$B.tar.xz"
 [[ "$(grep -c '/index.json' "$FIXTURE/requests")" == 1 ]]
 selected "$A"
 [[ -d "$DATA/current" ]]
@@ -70,10 +94,13 @@ run unset
 [[ ! -L "$TEST_BIN/zig" && ! -L "$DATA/current" ]]
 run uninstall "$B"
 [[ ! -e "$VERSIONS/$B" && -d "$VERSIONS/$A" ]]
-run install latest --no-zls
+run install latest --no-zls 2> "$tmp/err"
+grep -Fx "Resolving Zig latest for $TARGET..." "$tmp/err"
+grep -Fx "Downloading Zig $C..." "$tmp/err"
 [[ -d "$VERSIONS/$C" && ! -e "$VERSIONS/99.9.9" ]]
 [[ "$(grep -c '/index.json' "$FIXTURE/requests")" == 1 ]]
-run install "$DEV" --use
+run install "$DEV" --use 2> "$tmp/err"
+grep -Fx "Selected Zig $DEV." "$tmp/err"
 selected "$DEV"
 grep -F 'zig_version=0.11.0-dev.12%2Babc123&compatibility=full' "$FIXTURE/requests"
 run list --remote | grep -Fx "dev $DEV"
@@ -96,11 +123,15 @@ bad 'Checksum mismatch' install "$B" --use
 selected "$A"
 [[ ! -e "$VERSIONS/$B" ]]
 cp "$tmp/good-zls" "$FIXTURE/zls.json"
-run zls install
-[[ -x "$TEST_BIN/zls" ]]
+run zls install > "$tmp/out" 2> "$tmp/err"
+[[ ! -s "$tmp/out" && -x "$TEST_BIN/zls" ]]
+grep -Fx "Checking ZLS compatibility for Zig $A..." "$tmp/err"
+grep -Fx "Downloading ZLS $A..." "$tmp/err"
+grep -Fx "Installed ZLS for Zig $A." "$tmp/err"
 cp "$FIXTURE/requests" "$tmp/requests"
 run zls install
-run install "$A" --no-zls
+run install "$A" --no-zls 2> "$tmp/err"
+grep -Fx "Zig $A is already installed." "$tmp/err"
 cmp "$tmp/requests" "$FIXTURE/requests"
 [[ -x "$TEST_BIN/zls" ]]
 run use "$C"
@@ -172,6 +203,8 @@ touch "$FIXTURE/pause"
 "$DRIVER" "$ZVM" install "$B" --no-zls --use > "$tmp/install.out" 2> "$tmp/install.err" &
 child=$!
 reaches "$FIXTURE/paused" "$child" || { printf '%s\n' 'Install never paused' >&2; grep . "$tmp/install.err" >&2; exit 1; }
+grep -Fx "Downloading Zig $B..." "$tmp/install.err"
+[[ ! -s "$tmp/install.out" ]]
 run --help > /dev/null
 run list > /dev/null
 bad 'lock' unset
@@ -217,7 +250,8 @@ rm "$FIXTURE/bsdtar"
 cp "$FIXTURE/requests" "$tmp/requests"
 XDG_DATA_HOME="$tmp/independent-data" run install "$B" --no-zls
 [[ -x "$tmp/independent-data/zvm/versions/$B/zig" ]]
-run install "$B" --no-zls
+run install "$B" --no-zls 2> "$tmp/err"
+grep -Fx "Verifying cached Zig $B archive..." "$tmp/err"
 cmp "$tmp/requests" "$FIXTURE/requests"
 
 # Cancellation and confirmed removal, including bundled ZLS and active Zig.
@@ -233,7 +267,6 @@ selected "$B"
 bad 'Usage' uninstall "$A" --all
 snapshot "$tmp/work space" > "$tmp/before"
 bad '--yes' uninstall --all
-export ZVM_PATH="$ZVM" ZVM_TEST_BASH="$DRIVER"
 expect <<'TCL'
 set timeout 10
 spawn -noecho $env(ZVM_TEST_BASH) $env(ZVM_PATH) uninstall --all

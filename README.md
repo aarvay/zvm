@@ -58,6 +58,11 @@ zig version                # Verify the selected compiler
 
 Without `--use`, installing a toolchain does not change your selection.
 
+Install status goes to stderr, so stdout stays clear. On a terminal, Zig and ZLS
+archive downloads show a live progress bar. Redirected logs show plain status
+lines for download, verification, and extraction. Cached archives are verified
+before reuse.
+
 ## Work on a project with a pinned compiler
 
 Save one concrete Zig version in `.zvmrc` at the root of the project:
