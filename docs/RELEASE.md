@@ -2,7 +2,7 @@
 
 **Start here:** tell your agent, “Guide me through a signed zvm release using `docs/RELEASE.md`. Start with read-only preflight.” For everyday development, fixture tests and platform coverage, see [AGENTS.md](../AGENTS.md).
 
-**Agent contract:** inspect the actual repo and workflows first. Report the proposed tag, exact commit, destination and any blockers. Run local checks yourself; stop on any failure. Ask the maintainer to confirm the exact tag/commit before signing or pushing, and **separately** confirm before publishing the verified draft. Never ask for private key material or a passphrase in chat: the maintainer signs locally using GPG pinentry. Do not change account settings, invent credentials, force-push, overwrite assets, or publish the tap without approval. If resuming, inspect remote state instead of repeating commands blindly.
+**Agent contract:** inspect the actual repo and workflows first. Report the proposed tag, exact commit, destination and any blockers. Run local checks yourself; stop on any failure. Ask the maintainer to confirm the exact tag/commit before signing or pushing, and **separately** confirm before publishing the verified draft. Never ask for private key material or a passphrase in chat: the maintainer signs locally using GPG pinentry. Use the configured SSH remotes for Git. Tell the maintainer before Git or signing operations that may require a YubiKey touch; if authentication fails, stop and ask rather than switching to HTTPS or changing credentials. Do not change account settings, force-push, overwrite assets, or publish the tap without approval. If resuming, inspect remote state instead of repeating commands blindly.
 
 ## 0. One-time setup — required before pushing a release tag
 
@@ -85,7 +85,9 @@ gh release view "$TAG" --repo "$REPO" --json url,isDraft,tagName
 
 Verify the public tag URL and asset downloads. Users who want independent verification import the authenticated public key, then run `gpg --verify SHA256SUMS.asc SHA256SUMS` and `shasum -a 256 -c SHA256SUMS` alongside the downloaded assets. The convenience curl installer does not itself authenticate a GPG signature.
 
-From `../homebrew-tap`, run `bash scripts/update-zvm.sh "$TAG"` against the **published** assets. Review `Formula/zvm.rb`; with approval, open a tap PR and wait for `brew test-bot` before merging. Confirm `brew install aarvay/tap/zvm` and `brew test aarvay/tap/zvm` on a clean macOS setup. Report the release URL, tag/commit, signing fingerprint, check results and tap PR status. Remove only the private scratch directories created for this release after verification.
+From `../homebrew-tap`, run `bash scripts/update-zvm.sh "$TAG"` against the **published** assets. Review `Formula/zvm.rb`; with approval, open one tap PR and wait for **Formula CI** to pass. This job runs `brew install --build-from-source aarvay/tap/zvm` and `brew test aarvay/tap/zvm` on a clean macOS runner. The formula installs directly from the verified release bundle; no bottle build, `brew pr-pull`, or direct push to tap `main` is needed.
+
+Merge the tap PR using GitHub's normal **Create a merge commit** option (or `gh pr merge --merge`) to preserve the reviewed commits. Confirm GitHub marks it **Merged** and the formula on `main` points to the published tag. Report the release URL, tag/commit, signing fingerprint, check results and tap PR status. Remove only the private scratch directories created for this release after verification.
 
 ## If something fails
 
